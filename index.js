@@ -1,0 +1,251 @@
+import 'dotenv/config';
+import express from 'express';
+import bcrypt from 'bcrypt';
+import jwt from 'jsonwebtoken';
+import mongoose from 'mongoose';
+import User from './models/User.js';
+import { requireAuth } from './middleware/auth.js';
+import crypto from 'crypto';
+import RefreshToken from './models/RefreshToken.js';
+import cookieParser from 'cookie-parser';
+import { requireCsrf } from './middleware/csrf.js';
+
+const app = express();
+app.use(express.json());
+app.use(cookieParser()); // lets req.cookies read the raw Cookie header as an object
+
+mongoose.connect(process.env.MONGO_URI, {
+  dbName: 'auth-db-v2'
+})
+  .then(() => console.log('Connected to MongoDB'))
+  .catch((err) => console.error('MongoDB connection error:', err));
+
+app.get('/', (req, res) => {
+  res.send('Server is alive');
+});
+
+app.post('/register', async (req, res) => {
+  const { email, password } = req.body;
+
+  const hashedPassword = await bcrypt.hash(password, 10);
+
+  const user = await User.create({
+    email,
+    password: hashedPassword,
+  });
+
+  res.status(201).json({ id: user._id, email: user.email });
+});
+
+// Login 1
+// app.post('/login', async (req, res) => {
+//   const { email, password } = req.body;
+
+//   const user = await User.findOne({ email });
+//   if (!user) {
+//     return res.status(401).json({ message: 'Invalid credentials' });
+//   }
+
+//   const isMatch = await bcrypt.compare(password, user.password);
+//   if (!isMatch) {
+//     return res.status(401).json({ message: 'Invalid credentials' });
+//   }
+
+//   const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET, {
+//     expiresIn: '15m',
+//   });
+
+//   res.json({ token });
+// });
+
+// Login 2
+app.post('/login', async (req, res) => {
+  const { email, password } = req.body;
+
+  const user = await User.findOne({ email });
+  if (!user) {
+    return res.status(401).json({ message: 'Invalid credentials' });
+  }
+
+  const isMatch = await bcrypt.compare(password, user.password);
+  if (!isMatch) {
+    return res.status(401).json({ message: 'Invalid credentials' });
+  }
+
+  const accessToken = jwt.sign({ userId: user._id }, process.env.JWT_SECRET, {
+    expiresIn: '15m',
+  });
+
+  // One new random ID per login — ties every future rotation of this
+  // refresh token back to this same original session/device
+  const family = crypto.randomUUID();
+
+  const refreshToken = jwt.sign({ userId: user._id, family }, process.env.REFRESH_TOKEN_SECRET, {
+    expiresIn: '7d',
+  });
+
+  const tokenHash = crypto.createHash('sha256').update(refreshToken).digest('hex');
+  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+
+  await RefreshToken.create({ userId: user._id, family, tokenHash, expiresAt });
+
+  res.cookie('refreshToken', refreshToken, {
+    httpOnly: true,
+    secure: false,
+    sameSite: 'strict',
+    path: '/',
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+  });
+
+  // A random value the frontend must read and echo back as a header on
+  // state-changing requests — proves the request came from our own JS,
+  // not a forged cross-site request that only got the cookie sent automatically
+  const csrfToken = crypto.randomBytes(32).toString('hex');
+
+  res.cookie('csrfToken', csrfToken, {
+    httpOnly: false, // deliberately readable by JS — that's the whole point
+    secure: false,
+    sameSite: 'strict',
+    path: '/',
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+  });
+
+
+  res.json({ accessToken });
+});
+
+// Rfresh
+// app.post('/refresh', async (req, res) => {
+//   // Pull the refresh token out of the httpOnly cookie cookie-parser just decoded for us
+//   const refreshToken = req.cookies.refreshToken;
+
+//   if (!refreshToken) {
+//     return res.status(401).json({ message: 'No refresh token provided' });
+//   }
+
+//   // Check the signature is authentic and not expired — pure math, no DB hit yet
+//   let payload;
+//   try {
+//     payload = jwt.verify(refreshToken, process.env.REFRESH_TOKEN_SECRET);
+//   } catch (err) {
+//     return res.status(401).json({ message: 'Invalid refresh token' });
+//   }
+
+//   // Re-hash the raw token the same way we did at login, then look it up in the DB —
+//   // this is what makes it revocable eventhe signature is still technically valid
+//   const tokenHash = crypto.createHash('sha256').update(refreshToken).digest('hex');
+//   const stored = await RefreshToken.findOne({ tokenHash });
+
+//   if (!stored) {
+//     return res.status(401).json({ message: 'Refresh token not recognized' });
+//   }
+
+//   // Everything checked out — mint a fresh short-lived access token and hand it back
+//   const accessToken = jwt.sign({ userId: payload.userId }, process.env.JWT_SECRET, {
+//     expiresIn: '15m',
+//   });
+
+//   res.json({ accessToken });
+// });
+app.post('/refresh', requireCsrf, async (req, res) => {
+  // Pull the refresh token out of the httpOnly cookie
+  const refreshToken = req.cookies.refreshToken;
+
+  if (!refreshToken) {
+    return res.status(401).json({ message: 'No refresh token provided' });
+  }
+
+  // Confirm the signature is authentic and not expired, and recover userId + family
+  let payload;
+  try {
+    payload = jwt.verify(refreshToken, process.env.REFRESH_TOKEN_SECRET);
+  } catch (err) {
+    return res.status(401).json({ message: 'Invalid refresh token' });
+  }
+
+  const tokenHash = crypto.createHash('sha256').update(refreshToken).digest('hex');
+  const stored = await RefreshToken.findOne({ tokenHash });
+
+  if (!stored) {
+    // No row for this token — it must have already been rotated out and is
+    // now being replayed. Treat as theft: kill every token in this family.
+    await RefreshToken.deleteMany({ userId: payload.userId, family: payload.family });
+    return res.status(401).json({ message: 'Refresh token reuse detected — session revoked' });
+  }
+
+  // Legitimate single use: remove the token that was just presented...
+  await RefreshToken.deleteOne({ _id: stored._id });
+
+  // ...and issue a brand new one in the same family, continuing the chain
+  const newRefreshToken = jwt.sign(
+    { userId: payload.userId, family: payload.family },
+    process.env.REFRESH_TOKEN_SECRET,
+    { expiresIn: '7d' }
+  );
+  const newTokenHash = crypto.createHash('sha256').update(newRefreshToken).digest('hex');
+  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+
+  await RefreshToken.create({
+    userId: payload.userId,
+    family: payload.family,
+    tokenHash: newTokenHash,
+    expiresAt,
+  });
+
+  res.cookie('refreshToken', newRefreshToken, {
+    httpOnly: true,
+    secure: false,
+    sameSite: 'strict',
+    path: '/',
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+  });
+
+  // Rotate the CSRF token too, so it stays paired with the current refresh token
+  const newCsrfToken = crypto.randomBytes(32).toString('hex');
+  res.cookie('csrfToken', newCsrfToken, {
+    httpOnly: false,
+    secure: false,
+    sameSite: 'strict',
+    path: '/',
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+  });
+
+
+  const accessToken = jwt.sign({ userId: payload.userId }, process.env.JWT_SECRET, {
+    expiresIn: '15m',
+  });
+
+  res.json({ accessToken });
+});
+
+app.post('/logout', requireCsrf, async (req, res) => {
+  // Grab the refresh token from the cookie so we know which DB record to remove
+  const refreshToken = req.cookies.refreshToken;
+
+  if (refreshToken) {
+    // Same hash we stored at login — delete that row so this token can never be refreshed again
+    const tokenHash = crypto.createHash('sha256').update(refreshToken).digest('hex');
+    await RefreshToken.deleteOne({ tokenHash });
+  }
+
+  // Tell the browser to drop the cookie too — needs the same options used to set it,
+  // or the browser won't recognize it as the same cookie to clear
+  res.clearCookie('refreshToken', {
+    httpOnly: true,
+    secure: false,
+    sameSite: 'strict',
+    path: '/',
+  });
+
+  res.json({ message: 'Logged out' });
+});
+
+app.get('/me', requireAuth, (req, res) => {
+  res.json({ userId: req.userId });
+});
+
+
+const PORT = 3000;
+app.listen(PORT, () => {
+  console.log(`Listening on port ${PORT}`);
+});
