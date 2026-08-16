@@ -1,6 +1,8 @@
 import 'dotenv/config';
 import express from 'express';
 import bcrypt from 'bcrypt';
+import helmet from 'helmet';
+import cors from 'cors';
 import jwt from 'jsonwebtoken';
 import mongoose from 'mongoose';
 import rateLimit from 'express-rate-limit';
@@ -17,10 +19,39 @@ import { getPermissionsForRole } from './authorization/permissions.js';
 import Post from './models/Post.js';
 import { requirePermission } from './middleware/permissions.js';
 import { postSchema } from './validators/postSchemas.js';
+import logger from './utils/logger.js';
+
+const requiredEnvVars = ['MONGO_URI', 'JWT_SECRET', 'REFRESH_TOKEN_SECRET', 'ALLOWED_ORIGINS'];
+
+for (const key of requiredEnvVars) {
+  if (!process.env[key]) {
+    console.error(`Missing required environment variable: ${key}`);
+    process.exit(1);
+  }
+}
+
 
 const app = express();
+app.use(helmet());
 app.use(express.json());
 app.use(cookieParser()); // lets req.cookies read the raw Cookie header as an object
+
+
+const allowedOrigins = process.env.ALLOWED_ORIGINS.split(',');
+
+app.use(cors({
+  origin: (origin, callback) => {
+    // No Origin header means a non-browser caller (curl, Postman, server-to-server) — allow it
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true, // required for cookies to work once a browser frontend calls this API
+}));
+
+
 
 // Strict — login/register are rare, deliberate actions; no legitimate reason to hit these often
 const authLimiter = rateLimit({
@@ -76,11 +107,11 @@ app.post('/register', authLimiter, validate(registerSchema), async (req, res) =>
   await sendVerificationEmail(user.email, verificationToken);
 
 
-  res.status(201).json({ 
+  res.status(201).json({
     id: user._id,
     email: user.email,
     message: 'Registration successful. Check your email to verify your account.',
-   });
+  });
 
 });
 
@@ -176,6 +207,7 @@ app.post('/login', authLimiter, validate(loginSchema), async (req, res) => {
       user.failedLoginAttempts = 0;
     }
     await user.save();
+    logger.warn({ event: 'login_failed', email }, 'Failed login attempt');
     return res.status(401).json({ message: 'Invalid credentials' });
   }
 
@@ -183,6 +215,8 @@ app.post('/login', authLimiter, validate(loginSchema), async (req, res) => {
   user.failedLoginAttempts = 0;
   user.lockUntil = null;
   await user.save();
+  logger.info({ event: 'login_success', userId: user._id, email }, 'User logged in');
+
 
   const accessToken = jwt.sign({ userId: user._id }, process.env.JWT_SECRET, {
     expiresIn: '15m',
@@ -199,7 +233,16 @@ app.post('/login', authLimiter, validate(loginSchema), async (req, res) => {
   const tokenHash = crypto.createHash('sha256').update(refreshToken).digest('hex');
   const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
 
-  await RefreshToken.create({ userId: user._id, family, tokenHash, expiresAt });
+  await RefreshToken.create({
+    userId: user._id,
+    family,
+    tokenHash,
+    expiresAt,
+    userAgent: req.headers['user-agent'] || 'unknown',
+    ip: req.ip,
+    createdAt: new Date(),
+    lastUsedAt: new Date(),
+  });
 
   res.cookie('refreshToken', refreshToken, {
     httpOnly: true,
@@ -282,6 +325,7 @@ app.post('/refresh', refreshLimiter, requireCsrf, async (req, res) => {
     // No row for this token — it must have already been rotated out and is
     // now being replayed. Treat as theft: kill every token in this family.
     await RefreshToken.deleteMany({ userId: payload.userId, family: payload.family });
+    logger.warn({ event: 'refresh_reuse_detected', userId: payload.userId, family: payload.family }, 'Refresh token reuse detected — session revoked');
     return res.status(401).json({ message: 'Refresh token reuse detected — session revoked' });
   }
 
@@ -289,6 +333,8 @@ app.post('/refresh', refreshLimiter, requireCsrf, async (req, res) => {
   await RefreshToken.deleteOne({ _id: stored._id });
 
   // ...and issue a brand new one in the same family, continuing the chain
+  // createdAt and userAgent carry over from the old doc — this is still
+  // "the same session" from the user's point of view, just a rotated token
   const newRefreshToken = jwt.sign(
     { userId: payload.userId, family: payload.family },
     process.env.REFRESH_TOKEN_SECRET,
@@ -302,7 +348,14 @@ app.post('/refresh', refreshLimiter, requireCsrf, async (req, res) => {
     family: payload.family,
     tokenHash: newTokenHash,
     expiresAt,
+    userAgent: stored.userAgent,
+    ip: req.ip,
+    createdAt: stored.createdAt,
+    lastUsedAt: new Date(),
   });
+
+  logger.info({ event: 'token_refreshed', userId: payload.userId, family: payload.family }, 'Refresh token rotated');
+
 
   res.cookie('refreshToken', newRefreshToken, {
     httpOnly: true,
@@ -348,6 +401,8 @@ app.post('/logout', requireCsrf, async (req, res) => {
     sameSite: 'strict',
     path: '/',
   });
+
+  logger.info({ event: 'logout' }, 'User logged out');
 
   res.json({ message: 'Logged out' });
 });
@@ -453,7 +508,6 @@ app.get('/users', requireAuth, requirePermission('users:manage'), async (req, re
 });
 
 
-
 // Post related routes
 app.post('/posts', requireAuth, requirePermission('posts:create'), validate(postSchema), async (req, res) => {
   const { title, body } = req.body;
@@ -500,6 +554,32 @@ app.delete('/posts/:id', requireAuth, requirePermission('posts:delete'), async (
   }
   res.json({ message: 'Post deleted' });
 });
+
+
+
+// Session related routes
+app.get('/sessions', requireAuth, async (req, res) => {
+  // Never expose tokenHash — it's the one field that would let someone
+  // impersonate this session if it ever leaked
+  const sessions = await RefreshToken.find({ userId: req.userId }).select('-tokenHash');
+  res.json(sessions);
+});
+
+app.delete('/sessions/:id', requireAuth, async (req, res) => {
+  // Scoped to req.userId, not just :id — this is what stops one user from
+  // revoking a session that isn't theirs, even if they know its id
+  const session = await RefreshToken.findOneAndDelete({
+    _id: req.params.id,
+    userId: req.userId,
+  });
+
+  if (!session) {
+    return res.status(404).json({ message: 'Session not found' });
+  }
+
+  res.json({ message: 'Session revoked' });
+});
+
 
 
 

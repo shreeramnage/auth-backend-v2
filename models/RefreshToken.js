@@ -20,6 +20,23 @@ const refreshTokenSchema = new mongoose.Schema({
     type: Date,
     required: true,
   },
+  userAgent: {
+    type: String,
+    default: null,
+  },
+  ip: {
+    type: String,
+    default: null,
+  },
+  createdAt: {
+    type: Date,
+    default: Date.now,
+  },
+  lastUsedAt: {
+    type: Date,
+    default: Date.now,
+  },
+
 });
 
 refreshTokenSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
