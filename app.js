@@ -32,6 +32,8 @@ for (const key of requiredEnvVars) {
 
 
 const app = express();
+app.set('trust proxy', 1);
+
 app.use(helmet());
 app.use(express.json());
 app.use(cookieParser()); // lets req.cookies read the raw Cookie header as an object
