@@ -9,6 +9,8 @@ import crypto from 'crypto';
 import RefreshToken from './models/RefreshToken.js';
 import cookieParser from 'cookie-parser';
 import { requireCsrf } from './middleware/csrf.js';
+import { validate } from './middleware/validate.js';
+import { loginSchema, registerSchema } from './validators/authSchemas.js';
 
 const app = express();
 app.use(express.json());
@@ -24,7 +26,7 @@ app.get('/', (req, res) => {
   res.send('Server is alive');
 });
 
-app.post('/register', async (req, res) => {
+app.post('/register', validate(registerSchema), async (req, res) => {
   const { email, password } = req.body;
 
   const hashedPassword = await bcrypt.hash(password, 10);
@@ -59,7 +61,7 @@ app.post('/register', async (req, res) => {
 // });
 
 // Login 2
-app.post('/login', async (req, res) => {
+app.post('/login', validate(loginSchema), async (req, res) => {
   const { email, password } = req.body;
 
   const user = await User.findOne({ email });
@@ -243,6 +245,26 @@ app.post('/logout', requireCsrf, async (req, res) => {
 app.get('/me', requireAuth, (req, res) => {
   res.json({ userId: req.userId });
 });
+
+
+
+app.use((err, req, res, next) => {
+  // Mongo's unique index on email — a specific, expected failure, not a crash
+  if (err.code === 11000) {
+    return res.status(409).json({ message: 'Email already in use' });
+  }
+
+  // express.json() flags malformed JSON bodies with a 400 status already attached
+  if (err.status === 400 || err.statusCode === 400) {
+    return res.status(400).json({ message: 'Invalid request body' });
+  }
+
+  // Anything else is genuinely unexpected: log the real error for ourselves,
+  // but the client only ever sees a generic message — never a stack trace
+  console.error(err);
+  res.status(500).json({ message: 'Something went wrong' });
+});
+
 
 
 const PORT = 3000;
