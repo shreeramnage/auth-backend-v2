@@ -3,6 +3,7 @@ import express from 'express';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import mongoose from 'mongoose';
+import rateLimit from 'express-rate-limit';
 import User from './models/User.js';
 import { requireAuth } from './middleware/auth.js';
 import crypto from 'crypto';
@@ -16,6 +17,21 @@ const app = express();
 app.use(express.json());
 app.use(cookieParser()); // lets req.cookies read the raw Cookie header as an object
 
+// Strict — login/register are rare, deliberate actions; no legitimate reason to hit these often
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  // windowMs: 30 * 1000,
+  max: 10,
+  message: { message: 'Too many attempts, please try again later' },
+});
+
+// Looser — refresh happens automatically and often during normal use
+const refreshLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  message: { message: 'Too many requests, please try again later' },
+});
+
 mongoose.connect(process.env.MONGO_URI, {
   dbName: 'auth-db-v2'
 })
@@ -26,7 +42,7 @@ app.get('/', (req, res) => {
   res.send('Server is alive');
 });
 
-app.post('/register', validate(registerSchema), async (req, res) => {
+app.post('/register', authLimiter, validate(registerSchema), async (req, res) => {
   const { email, password } = req.body;
 
   const hashedPassword = await bcrypt.hash(password, 10);
@@ -61,7 +77,7 @@ app.post('/register', validate(registerSchema), async (req, res) => {
 // });
 
 // Login 2
-app.post('/login', validate(loginSchema), async (req, res) => {
+app.post('/login', authLimiter, validate(loginSchema), async (req, res) => {
   const { email, password } = req.body;
 
   const user = await User.findOne({ email });
@@ -69,10 +85,33 @@ app.post('/login', validate(loginSchema), async (req, res) => {
     return res.status(401).json({ message: 'Invalid credentials' });
   }
 
+  // Check the lock BEFORE spending time on bcrypt.compare — a locked account
+  // stays locked no matter how correct the password guess is
+  if (user.lockUntil && user.lockUntil > new Date()) {
+    return res.status(429).json({ message: 'Account locked due to too many failed attempts, try again later' });
+  }
+
   const isMatch = await bcrypt.compare(password, user.password);
+  // if (!isMatch) {
+  //   return res.status(401).json({ message: 'Invalid credentials' });
+  // }
+
   if (!isMatch) {
+    // Wrong password: count it, and lock the account once the count crosses the line
+    user.failedLoginAttempts += 1;
+    if (user.failedLoginAttempts >= 5) {
+      // user.lockUntil = new Date(Date.now() + 15 * 60 * 1000);
+      user.lockUntil = new Date(Date.now() + 15 * 1000); // was 15 * 60 * 1000 — 15 seconds for testing
+      user.failedLoginAttempts = 0;
+    }
+    await user.save();
     return res.status(401).json({ message: 'Invalid credentials' });
   }
+
+  // Correct password: clear any prior failure history
+  user.failedLoginAttempts = 0;
+  user.lockUntil = null;
+  await user.save();
 
   const accessToken = jwt.sign({ userId: user._id }, process.env.JWT_SECRET, {
     expiresIn: '15m',
@@ -149,7 +188,7 @@ app.post('/login', validate(loginSchema), async (req, res) => {
 
 //   res.json({ accessToken });
 // });
-app.post('/refresh', requireCsrf, async (req, res) => {
+app.post('/refresh', refreshLimiter, requireCsrf, async (req, res) => {
   // Pull the refresh token out of the httpOnly cookie
   const refreshToken = req.cookies.refreshToken;
 

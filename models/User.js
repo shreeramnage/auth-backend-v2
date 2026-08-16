@@ -10,6 +10,14 @@ const userSchema = new mongoose.Schema({
     type: String,
     required: true,
   },
+  failedLoginAttempts: {
+    type: Number,
+    default: 0,
+  },
+  lockUntil: {
+    type: Date,
+    default: null,
+  },
 });
 
 export default mongoose.model('User', userSchema);
