@@ -607,7 +607,7 @@ app.delete('/sessions/:id', requireAuth, async (req, res) => {
 
 // Health Check
 app.get('/health', (req, res) => {
-    res.json({ status: 'ok' });
+    res.json({ status: 'ok', version: '1.0.1' });
 });
 
 
