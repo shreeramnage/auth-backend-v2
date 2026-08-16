@@ -13,6 +13,10 @@ import { requireCsrf } from './middleware/csrf.js';
 import { validate } from './middleware/validate.js';
 import { changePasswordSchema, forgotPasswordSchema, loginSchema, registerSchema, resetPasswordSchema } from './validators/authSchemas.js';
 import { sendPasswordResetEmail, sendVerificationEmail } from './utils/mailer.js';
+import { getPermissionsForRole } from './authorization/permissions.js';
+import Post from './models/Post.js';
+import { requirePermission } from './middleware/permissions.js';
+import { postSchema } from './validators/postSchemas.js';
 
 const app = express();
 app.use(express.json());
@@ -348,9 +352,22 @@ app.post('/logout', requireCsrf, async (req, res) => {
   res.json({ message: 'Logged out' });
 });
 
-app.get('/me', requireAuth, (req, res) => {
-  res.json({ userId: req.userId });
+// app.get('/me', requireAuth, (req, res) => {
+//   res.json({ userId: req.userId });
+// });
+app.get('/me', requireAuth, async (req, res) => {
+  // Look up the current role fresh, same reasoning as requirePermission —
+  // this response should reflect reality right now, not what the JWT was told at login
+  const user = await User.findById(req.userId);
+
+  res.json({
+    userId: user._id,
+    email: user.email,
+    role: user.role,
+    permissions: getPermissionsForRole(user.role),
+  });
 });
+
 
 app.post('/forgot-password', validate(forgotPasswordSchema), async (req, res) => {
   const { email } = req.body;
@@ -428,6 +445,60 @@ app.post('/change-password', requireAuth, validate(changePasswordSchema), async 
   await RefreshToken.deleteMany({ userId: user._id });
 
   res.json({ message: 'Password changed. All sessions have been logged out.' });
+});
+
+app.get('/users', requireAuth, requirePermission('users:manage'), async (req, res) => {
+  const users = await User.find().select('-password -emailVerificationTokenHash -passwordResetTokenHash');
+  res.json(users);
+});
+
+
+
+// Post related routes
+app.post('/posts', requireAuth, requirePermission('posts:create'), validate(postSchema), async (req, res) => {
+  const { title, body } = req.body;
+
+  // authorId comes from the verified token, never from the request body —
+  // otherwise anyone could create a post claiming to be someone else
+  const post = await Post.create({ title, body, authorId: req.userId });
+
+  res.status(201).json(post);
+});
+
+app.get('/posts', requireAuth, requirePermission('posts:read'), async (req, res) => {
+  const posts = await Post.find();
+  res.json(posts);
+});
+
+app.get('/posts/:id', requireAuth, requirePermission('posts:read'), async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post) {
+    return res.status(404).json({ message: 'Post not found' });
+  }
+  res.json(post);
+});
+
+app.put('/posts/:id', requireAuth, requirePermission('posts:update'), validate(postSchema), async (req, res) => {
+  const { title, body } = req.body;
+
+  const post = await Post.findByIdAndUpdate(
+    req.params.id,
+    { title, body },
+    { new: true } // return the updated document, not the pre-update one
+  );
+
+  if (!post) {
+    return res.status(404).json({ message: 'Post not found' });
+  }
+  res.json(post);
+});
+
+app.delete('/posts/:id', requireAuth, requirePermission('posts:delete'), async (req, res) => {
+  const post = await Post.findByIdAndDelete(req.params.id);
+  if (!post) {
+    return res.status(404).json({ message: 'Post not found' });
+  }
+  res.json({ message: 'Post deleted' });
 });
 
 
