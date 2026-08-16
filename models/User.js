@@ -18,6 +18,18 @@ const userSchema = new mongoose.Schema({
     type: Date,
     default: null,
   },
+  emailVerified: {
+    type: Boolean,
+    default: false,
+  },
+  emailVerificationTokenHash: {
+    type: String,
+    default: null,
+  },
+  passwordResetTokenHash: {
+    type: String,
+    default: null,
+  },
 });
 
 export default mongoose.model('User', userSchema);

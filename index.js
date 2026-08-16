@@ -11,7 +11,8 @@ import RefreshToken from './models/RefreshToken.js';
 import cookieParser from 'cookie-parser';
 import { requireCsrf } from './middleware/csrf.js';
 import { validate } from './middleware/validate.js';
-import { loginSchema, registerSchema } from './validators/authSchemas.js';
+import { changePasswordSchema, forgotPasswordSchema, loginSchema, registerSchema, resetPasswordSchema } from './validators/authSchemas.js';
+import { sendPasswordResetEmail, sendVerificationEmail } from './utils/mailer.js';
 
 const app = express();
 app.use(express.json());
@@ -52,8 +53,74 @@ app.post('/register', authLimiter, validate(registerSchema), async (req, res) =>
     password: hashedPassword,
   });
 
-  res.status(201).json({ id: user._id, email: user.email });
+  // A purpose-locked, short-lived JWT — signature proves it's really from us,
+  // 'purpose' stops it being reused for anything other than email verification
+  const verificationToken = jwt.sign(
+    { userId: user._id, purpose: 'verify-email' },
+    process.env.JWT_SECRET,
+    { expiresIn: '1h' }
+  );
+
+  // Store only the hash, same single-use pattern as refresh tokens —
+  // consuming it later will clear this field so it can't be replayed
+  user.emailVerificationTokenHash = crypto.createHash('sha256').update(verificationToken).digest('hex');
+  await user.save();
+
+  // Standing in for "send an email" — logging the raw token so you can copy it
+  console.log('Verification token for', email, ':', verificationToken);
+  // Actually send it — this is the real inbox now, not a console log
+  await sendVerificationEmail(user.email, verificationToken);
+
+
+  res.status(201).json({ 
+    id: user._id,
+    email: user.email,
+    message: 'Registration successful. Check your email to verify your account.',
+   });
+
 });
+
+
+app.post('/verify-email', async (req, res) => {
+  const { token } = req.body;
+
+  if (!token) {
+    return res.status(400).json({ message: 'Token is required' });
+  }
+
+  // Confirm the signature and expiry first — cheap, no DB hit yet
+  let payload;
+  try {
+    payload = jwt.verify(token, process.env.JWT_SECRET);
+  } catch (err) {
+    return res.status(400).json({ message: 'Invalid or expired token' });
+  }
+
+  // Purpose lock — this token must have been minted specifically for email verification
+  if (payload.purpose !== 'verify-email') {
+    return res.status(400).json({ message: 'Invalid token' });
+  }
+
+  const user = await User.findById(payload.userId);
+  if (!user) {
+    return res.status(400).json({ message: 'Invalid token' });
+  }
+
+  // Single-use check: hash what was presented, compare to the one stored hash.
+  // If it's already null (used before) or doesn't match, reject.
+  const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+  if (user.emailVerificationTokenHash !== tokenHash) {
+    return res.status(400).json({ message: 'Invalid or already-used token' });
+  }
+
+  // Consume it: flip the flag, clear the hash so this exact token can never work again
+  user.emailVerified = true;
+  user.emailVerificationTokenHash = null;
+  await user.save();
+
+  res.json({ message: 'Email verified' });
+});
+
 
 // Login 1
 // app.post('/login', async (req, res) => {
@@ -284,6 +351,86 @@ app.post('/logout', requireCsrf, async (req, res) => {
 app.get('/me', requireAuth, (req, res) => {
   res.json({ userId: req.userId });
 });
+
+app.post('/forgot-password', validate(forgotPasswordSchema), async (req, res) => {
+  const { email } = req.body;
+
+  const user = await User.findOne({ email });
+
+  // Only actually do anything if the account exists — but respond identically either way,
+  // so the response itself never reveals whether that email is registered
+  if (user) {
+    const resetToken = jwt.sign(
+      { userId: user._id, purpose: 'password-reset' },
+      process.env.JWT_SECRET,
+      { expiresIn: '15m' }
+    );
+
+    user.passwordResetTokenHash = crypto.createHash('sha256').update(resetToken).digest('hex');
+    await user.save();
+
+    await sendPasswordResetEmail(user.email, resetToken);
+  }
+
+  res.json({ message: 'If that email is registered, a reset link has been sent' });
+});
+
+app.post('/reset-password', validate(resetPasswordSchema), async (req, res) => {
+  const { token, newPassword } = req.body;
+
+  let payload;
+  try {
+    payload = jwt.verify(token, process.env.JWT_SECRET);
+  } catch (err) {
+    return res.status(400).json({ message: 'Invalid or expired token' });
+  }
+
+  if (payload.purpose !== 'password-reset') {
+    return res.status(400).json({ message: 'Invalid token' });
+  }
+
+  const user = await User.findById(payload.userId);
+  if (!user) {
+    return res.status(400).json({ message: 'Invalid token' });
+  }
+
+  const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+  if (user.passwordResetTokenHash !== tokenHash) {
+    return res.status(400).json({ message: 'Invalid or already-used token' });
+  }
+
+  // Consume it: set the new password, clear the hash so this exact token dies here
+  user.password = await bcrypt.hash(newPassword, 10);
+  user.passwordResetTokenHash = null;
+  await user.save();
+
+  res.json({ message: 'Password reset successful' });
+});
+
+app.post('/change-password', requireAuth, validate(changePasswordSchema), async (req, res) => {
+  const { currentPassword, newPassword } = req.body;
+
+  const user = await User.findById(req.userId);
+
+  // Confirm they actually know the current password before allowing a change —
+  // otherwise a stolen access token alone could be used to lock the real owner out
+  const isMatch = await bcrypt.compare(currentPassword, user.password);
+  if (!isMatch) {
+    return res.status(401).json({ message: 'Current password is incorrect' });
+  }
+
+  user.password = await bcrypt.hash(newPassword, 10);
+  await user.save();
+
+  // Kill every session for this user, everywhere — not just this one.
+  // A password change is often a response to suspected compromise, so
+  // leaving any old refresh token alive would defeat the point of it
+  await RefreshToken.deleteMany({ userId: user._id });
+
+  res.json({ message: 'Password changed. All sessions have been logged out.' });
+});
+
+
 
 
 
