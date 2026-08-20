@@ -51,21 +51,24 @@ app.use(cors({
         }
     },
     credentials: true, // required for cookies to work once a browser frontend calls this API
+    exposedHeaders: ['RateLimit-Reset']
 }));
 
 
 
 // Strict — login/register are rare, deliberate actions; no legitimate reason to hit these often
 const authLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    // windowMs: 30 * 1000,
+    // windowMs: 15 * 60 * 1000,
+    windowMs: 30 * 1000,
     max: 10,
+    standardHeaders: true,
     message: { message: 'Too many attempts, please try again later' },
 });
 
 // Looser — refresh happens automatically and often during normal use
 const refreshLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
+    // windowMs: 15 * 60 * 1000,
+    windowMs: 50 * 1000,
     max: 30,
     message: { message: 'Too many requests, please try again later' },
 });
@@ -163,6 +166,34 @@ app.post('/verify-email', async (req, res) => {
     res.json({ message: 'Email verified' });
 });
 
+app.post('/resend-verification', requireAuth, async (req, res) => {
+    const user = await User.findById(req.userId);
+
+    if (user.emailVerified) {
+        return res.json({ message: 'Email already verified' });
+    }
+
+    const verificationToken = jwt.sign(
+        { userId: user._id, purpose: 'verify-email' },
+        process.env.JWT_SECRET,
+        { expiresIn: '1h' }
+    );
+
+    user.emailVerificationTokenHash = crypto.createHash('sha256').update(verificationToken).digest('hex');
+    await user.save();
+
+    console.log('Verification token for', user.email, ':', verificationToken);
+    if (process.env.NODE_ENV !== 'test') {
+        await sendVerificationEmail(user.email, verificationToken);
+    }
+
+    res.json({
+        message: 'Verification email sent',
+        ...(process.env.NODE_ENV === 'test' && { verificationToken }),
+    });
+});
+
+
 
 // Login 1
 // app.post('/login', async (req, res) => {
@@ -229,7 +260,7 @@ app.post('/login', authLimiter, validate(loginSchema), async (req, res) => {
     //     expiresIn: '15m',
     // });
     const accessToken = jwt.sign({ userId: user._id, jti: crypto.randomUUID() }, process.env.JWT_SECRET, {
-        expiresIn: '15m',
+        expiresIn: process.env.ACCESSTOKEN_TTL,
     });
 
 
@@ -277,6 +308,7 @@ app.post('/login', authLimiter, validate(loginSchema), async (req, res) => {
         secure: false,
         sameSite: 'strict',
         path: '/',
+        domain: '.nlmsh.online',
         maxAge: 7 * 24 * 60 * 60 * 1000,
     });
 
@@ -334,7 +366,8 @@ app.post('/refresh', refreshLimiter, requireCsrf, async (req, res) => {
     }
 
     const tokenHash = crypto.createHash('sha256').update(refreshToken).digest('hex');
-    const stored = await RefreshToken.findOne({ tokenHash });
+    // const stored = await RefreshToken.findOne({ tokenHash });
+    const stored = await RefreshToken.findOneAndDelete({ tokenHash });
 
     if (!stored) {
         // No row for this token — it must have already been rotated out and is
@@ -345,7 +378,7 @@ app.post('/refresh', refreshLimiter, requireCsrf, async (req, res) => {
     }
 
     // Legitimate single use: remove the token that was just presented...
-    await RefreshToken.deleteOne({ _id: stored._id });
+    // await RefreshToken.deleteOne({ _id: stored._id });
 
     // ...and issue a brand new one in the same family, continuing the chain
     // createdAt and userAgent carry over from the old doc — this is still
@@ -393,6 +426,7 @@ app.post('/refresh', refreshLimiter, requireCsrf, async (req, res) => {
         secure: false,
         sameSite: 'strict',
         path: '/',
+        domain: '.nlmsh.online',
         maxAge: 7 * 24 * 60 * 60 * 1000,
     });
 
@@ -401,10 +435,8 @@ app.post('/refresh', refreshLimiter, requireCsrf, async (req, res) => {
     //     expiresIn: '15m',
     // });
     const accessToken = jwt.sign({ userId: payload.userId, jti: crypto.randomUUID() }, process.env.JWT_SECRET, {
-        expiresIn: '15m',
+        expiresIn: process.env.ACCESSTOKEN_TTL,
     });
-
-
     res.json({ accessToken });
 });
 
@@ -444,6 +476,7 @@ app.get('/me', requireAuth, async (req, res) => {
         userId: user._id,
         email: user.email,
         role: user.role,
+        emailVerified: user.emailVerified,
         permissions: getPermissionsForRole(user.role),
     });
 });
@@ -587,7 +620,23 @@ app.get('/sessions', requireAuth, async (req, res) => {
     // Never expose tokenHash — it's the one field that would let someone
     // impersonate this session if it ever leaked
     const sessions = await RefreshToken.find({ userId: req.userId }).select('-tokenHash');
-    res.json(sessions);
+
+    const currentTokenHash = req.cookies.refreshToken
+        ? crypto.createHash('sha256').update(req.cookies.refreshToken).digest('hex')
+        : null;
+
+    const sessionsWithCurrent = await Promise.all(
+        sessions.map(async (s) => {
+            const raw = await RefreshToken.findById(s._id).select('tokenHash');
+            return {
+                ...s.toObject(),
+                isCurrent: raw.tokenHash === currentTokenHash,
+            };
+        })
+    );
+
+    // res.json(sessions);
+    res.json(sessionsWithCurrent);
 });
 
 app.delete('/sessions/:id', requireAuth, async (req, res) => {
