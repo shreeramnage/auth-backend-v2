@@ -308,7 +308,7 @@ app.post('/login', authLimiter, validate(loginSchema), async (req, res) => {
         secure: false,
         sameSite: 'strict',
         path: '/',
-        domain: '.nlmsh.online',
+        // domain: '.nlmsh.online',
         maxAge: 7 * 24 * 60 * 60 * 1000,
     });
 
@@ -426,7 +426,7 @@ app.post('/refresh', refreshLimiter, requireCsrf, async (req, res) => {
         secure: false,
         sameSite: 'strict',
         path: '/',
-        domain: '.nlmsh.online',
+        // domain: '.nlmsh.online',
         maxAge: 7 * 24 * 60 * 60 * 1000,
     });
 
