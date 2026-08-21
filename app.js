@@ -308,7 +308,7 @@ app.post('/login', authLimiter, validate(loginSchema), async (req, res) => {
         secure: false,
         sameSite: 'strict',
         path: '/',
-        // domain: '.nlmsh.online',
+        domain: '.nlmsh.online',
         maxAge: 7 * 24 * 60 * 60 * 1000,
     });
 
@@ -426,7 +426,7 @@ app.post('/refresh', refreshLimiter, requireCsrf, async (req, res) => {
         secure: false,
         sameSite: 'strict',
         path: '/',
-        // domain: '.nlmsh.online',
+        domain: '.nlmsh.online',
         maxAge: 7 * 24 * 60 * 60 * 1000,
     });
 
@@ -668,7 +668,7 @@ app.get('/health', (req, res) => {
 app.use((err, req, res, next) => {
     // Mongo's unique index on email — a specific, expected failure, not a crash
     if (err.code === 11000) {
-        
+
         return res.status(409).json({ message: 'Email already in use' });
     }
 
